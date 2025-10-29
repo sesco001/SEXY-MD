@@ -1,16 +1,16 @@
 /**
- * Knight Bot - A WhatsApp Bot (modified)
- * Supports:
- *  - SESSION_ID env var (default "marcas")
- *  - single-file creds.json via CREDS_JSON_PATH env or ./creds.json
- *  - outputs QR as base64 (stored in memory & file)
+ * Knight Bot - Heroku-ready WhatsApp Bot (modified)
+ * - Accepts Base64 session via env var (marcas; or MAKAMESCO-MD<=>)
+ * - Uses SESSION_ID to isolate sessions (scan-<SESSION_ID>/)
+ * - Writes scan-<SESSION_ID>/creds.json for Baileys (no QR required on deploy)
+ * - Starts simple HTTP server on $PORT for Heroku
  */
+
 require('./settings')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
 const fsExtra = require('fs-extra')
 const chalk = require('chalk')
-const FileType = require('file-type')
 const path = require('path')
 const axios = require('axios')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
@@ -20,7 +20,6 @@ const { smsg, isUrl, generateMessageTag, getBuffer, getSizeMedia, fetch, await, 
 const { 
     default: makeWASocket,
     useMultiFileAuthState, 
-    useSingleFileAuthState,
     DisconnectReason, 
     fetchLatestBaileysVersion,
     generateForwardMessageContent,
@@ -44,14 +43,12 @@ const { PHONENUMBER_MCC } = require('@whiskeysockets/baileys/lib/Utils/generics'
 const { rmSync, existsSync } = require('fs')
 const { join } = require('path')
 
-// Create a store object with required methods (unchanged)
+// ---------- Keep your store object ----------
 const store = {
     messages: {},
     contacts: {},
     chats: {},
-    groupMetadata: async (jid) => {
-        return {}
-    },
+    groupMetadata: async (jid) => { return {} },
     bind: function(ev) {
         ev.on('messages.upsert', ({ messages }) => {
             messages.forEach(msg => {
@@ -61,98 +58,134 @@ const store = {
                 }
             })
         })
-
         ev.on('contacts.update', (contacts) => {
             contacts.forEach(contact => {
-                if (contact.id) {
-                    this.contacts[contact.id] = contact
-                }
+                if (contact.id) this.contacts[contact.id] = contact
             })
         })
-
-        ev.on('chats.set', (chats) => {
-            this.chats = chats
-        })
+        ev.on('chats.set', (chats) => { this.chats = chats })
     },
     loadMessage: async (jid, id) => {
         return this.messages[jid]?.[id] || null
     }
 }
+// ---------- end store ----------
 
-let phoneNumber = "254769995625"
+let phoneNumber = "254112192119"
 let owner = JSON.parse(fs.readFileSync('./data/owner.json'))
 
-global.botname = "sexy-XMD BOT"
+global.botname = "JINX-XMD BOT"
 global.themeemoji = "•"
 
 const settings = require('./settings')
-const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code")
+
+// ---- Session config / env ----
+// Provide Base64 session in HEROKU (or any host) as: SESSION (or SESSION_BASE64)
+// Example values you might set on Heroku:
+// SESSION=marcas;BASE64STRING...
+// SESSION=MAKAMESCO-MD<=>BASE64STRING...
+// or just raw base64 string
+const SESSION_RAW = process.env.SESSION || process.env.SESSION_BASE64 || process.env.SESSION_ID_BASE64 || ''
+const SESSION_ID = (process.env.SESSION_ID && String(process.env.SESSION_ID).trim().length > 0) ? process.env.SESSION_ID.trim() : 'marcas'
+const HTTP_PORT = process.env.PORT || 3000
+
+// pairing disabled when we have SESSION_RAW present (deploy mode)
+const pairingCode = Boolean( (!SESSION_RAW) && (!!phoneNumber || process.argv.includes("--pairing-code")) )
 const useMobile = process.argv.includes("--mobile")
 
-// Only create readline interface if we're in an interactive environment
+// Only create readline if interactive
 const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
 const question = (text) => {
-    if (rl) {
-        return new Promise((resolve) => rl.question(text, resolve))
-    } else {
-        // In non-interactive environment, use ownerNumber from settings
-        return Promise.resolve(settings.ownerNumber || phoneNumber)
-    }
+    if (rl) return new Promise((resolve) => rl.question(text, resolve))
+    return Promise.resolve(settings.ownerNumber || phoneNumber)
 }
 
-// SESSION and CREDS handling
-const SESSION_ID = process.env.SESSION_ID && String(process.env.SESSION_ID).trim().length > 0 ? process.env.SESSION_ID.trim() : 'marcas'
-const sessionDir = `./session-${SESSION_ID}` // per-session folder (persistent)
-const credsSingleFileEnv = process.env.CREDS_JSON_PATH || './creds.json' // single-file creds path preferred
-const useSingleFileCreds = fs.existsSync(credsSingleFileEnv) // switch to single-file mode if creds exist
+// ensure the session target folder (scan-<id>) exists
+const sessionFolder = path.join(__dirname, `scan-${SESSION_ID}`)
+fsExtra.ensureDirSync(sessionFolder)
+const credsFilePath = path.join(sessionFolder, 'creds.json')
 
-// In-memory store for latest QR (base64) per session
-const qrStore = {}
-
-// tiny express server to serve QR if wanted (optional)
-const app = express()
-app.get('/pair', (req, res) => {
-    const b64 = qrStore[SESSION_ID]
-    if (!b64) return res.json({ status: 'NO_QR', message: 'No QR available yet. Start the bot and visit again.' })
-    res.json({ status: 'QR_READY', session: SESSION_ID, qr: b64 })
-})
-const HTTP_PORT = process.env.HTTP_PORT || 3000
-app.listen(HTTP_PORT, () => {
-    console.log(chalk.gray(`[HTTP] QR endpoint available on http://localhost:${HTTP_PORT}/pair for session ${SESSION_ID}`))
-})
-
-// Helper: return auth state (either single-file or multi-file)
-async function getAuthState(sessionFolder) {
-    // ensure session folder exists for multi-file case
-    if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true })
-
-    if (useSingleFileCreds) {
-        // use single file auth state (creds.json)
-        try {
-            console.log(chalk.green(`[AUTH] Using single-file creds from ${credsSingleFileEnv}`))
-            const { state, saveCreds } = await useSingleFileAuthState(credsSingleFileEnv)
-            return { state, saveCreds, path: credsSingleFileEnv, single: true }
-        } catch (e) {
-            console.error(chalk.red(`[AUTH] Failed to use single-file creds: ${e.message}`))
-            // fallback to multi-file
+// Helper: write base64 -> creds.json (if provided)
+async function restoreCredsFromEnv() {
+    try {
+        if (!SESSION_RAW) {
+            if (fs.existsSync(credsFilePath)) {
+                console.log(chalk.green(`[AUTH] Using existing creds at ${credsFilePath}`))
+                return true
+            } else {
+                console.log(chalk.yellow('[AUTH] No SESSION env provided and no local creds found. Pairing (QR) will be used locally.'))
+                return false
+            }
         }
-    }
 
-    // default: multi-file auth state inside sessionFolder
-    const { state, saveCreds } = await useMultiFileAuthState(sessionFolder)
-    return { state, saveCreds, path: sessionFolder, single: false }
+        // strip known prefixes
+        let cleaned = SESSION_RAW.replace(/MAKAMESCO-MD<=>/g, '')
+                                .replace(/^marcas;?/i, '')
+                                .trim()
+
+        if (!cleaned) {
+            console.log(chalk.red('[AUTH] SESSION env did not contain useful data after stripping prefixes.'))
+            return false
+        }
+
+        // decode base64; if it's already JSON plain then Buffer will throw? we still try
+        let decoded = ''
+        try {
+            decoded = Buffer.from(cleaned, 'base64').toString('utf8')
+        } catch (e) {
+            // fallback: maybe the env is raw JSON or not base64; write as-is
+            decoded = cleaned
+        }
+
+        // quick validation: should look like JSON with "creds" or something
+        let looksLikeJson = false
+        try { JSON.parse(decoded); looksLikeJson = true } catch (e) { looksLikeJson = false }
+
+        if (!looksLikeJson) {
+            console.log(chalk.yellow('[AUTH] Decoded session does not parse as JSON. Will write raw string to creds file (may fail).'))
+        }
+
+        // write to creds.json
+        fs.writeFileSync(credsFilePath, decoded, 'utf8')
+        console.log(chalk.green(`[AUTH] Written credentials to ${credsFilePath} from SESSION env (SESSION_ID=${SESSION_ID})`))
+        return true
+    } catch (err) {
+        console.error(chalk.red('[AUTH] Failed restoring creds from env:'), err)
+        return false
+    }
 }
 
-async function startXeonBotInc() {
-    let { version, isLatest } = await fetchLatestBaileysVersion()
-    const { state, saveCreds, path: authPath, single: authSingle } = await getAuthState(sessionDir)
+// Express server for Heroku (health + session info)
+const app = express()
+app.get('/', (req, res) => res.send({ status: 'ok', sessionId: SESSION_ID }))
+app.get('/health', (req, res) => res.send('OK'))
+app.get('/session-info', (req, res) => {
+    res.json({
+        sessionId: SESSION_ID,
+        hasEnvSession: !!SESSION_RAW,
+        credsFileExists: fs.existsSync(credsFilePath),
+        credsFilePath
+    })
+})
+app.listen(HTTP_PORT, () => console.log(chalk.gray(`[HTTP] Running on port ${HTTP_PORT}`)))
 
+// ---------- Main function ----------
+async function startXeonBotInc() {
+    // restore creds from SESSION env first (if provided)
+    const restored = await restoreCredsFromEnv()
+
+    // get Baileys version
+    let { version, isLatest } = await fetchLatestBaileysVersion()
+    // use the session folder (scan-<id>) so creds.json is read by Baileys' multi-file state
+    const { state, saveCreds } = await useMultiFileAuthState(sessionFolder)
     const msgRetryCounterCache = new NodeCache()
 
+    // create socket
     const XeonBotInc = makeWASocket({
         version,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // we'll handle QR as base64 and optionally terminal output
+        // disable printing QR in terminal on deploy if we restored creds from env
+        printQRInTerminal: !restored && !pairingCode, 
         browser: ["Ubuntu", "Chrome", "20.0.04"],
         auth: {
             creds: state.creds,
@@ -169,95 +202,9 @@ async function startXeonBotInc() {
         defaultQueryTimeoutMs: undefined,
     })
 
+    // bind store & events
     store.bind(XeonBotInc.ev)
 
-    // Listen for QR codes and store base64 - also optionally write to a file for external platforms
-    XeonBotInc.ev.on('connection.update', async (update) => {
-        try {
-            const { connection, lastDisconnect, qr } = update
-
-            if (qr) {
-                // convert QR to base64 PNG
-                try {
-                    const qrImage = await qrcode.toDataURL(qr) // data:image/png;base64,...
-                    qrStore[SESSION_ID] = qrImage
-                    // write to session folder for external access
-                    try {
-                        const outPath = path.join(sessionDir, 'last_qr.b64.txt')
-                        fsExtra.ensureDirSync(sessionDir)
-                        fs.writeFileSync(outPath, qrImage)
-                    } catch (err) {
-                        console.error(chalk.red('[QR] Could not write QR file:'), err.message)
-                    }
-                    // also print short notice to terminal
-                    console.log(chalk.cyan(`[QR] Base64 QR generated for session "${SESSION_ID}". Use /pair endpoint or check ${sessionDir}/last_qr.b64.txt`))
-                } catch (err) {
-                    console.error(chalk.red('[QR] Failed to generate base64 QR:'), err)
-                }
-            }
-
-            if (connection == "open") {
-                console.log(chalk.magenta(` `))
-                console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
-                
-                const botNumber = XeonBotInc.user.id.split(':')[0] + '@s.whatsapp.net';
-                await XeonBotInc.sendMessage(botNumber, { 
-                    text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!
-                    \n✅Make sure to join below channel`,
-                    contextInfo: {
-                        forwardingScore: 1,
-                        isForwarded: true,
-                        forwardedNewsletterMessageInfo: {
-                            newsletterJid: '120363418628641913@newsletter',
-                            newsletterName: 'SEXY-XMD',
-                            serverMessageId: -1
-                        }
-                    }
-                });
-
-                await delay(1999)
-                console.log(chalk.yellow(`\n\n                  ${chalk.bold.blue(`[ ${global.botname || 'KNIGHT BOT'} ]`)}\n\n`))
-                console.log(chalk.cyan(`< ================================================== >`))
-                console.log(chalk.magenta(`\n${global.themeemoji || '•'} YT CHANNEL: MR HACKER`))
-                console.log(chalk.magenta(`${global.themeemoji || '•'} GITHUB: caseyweb`))
-                console.log(chalk.magenta(`${global.themeemoji || '•'} WA NUMBER: ${owner}`))
-                console.log(chalk.magenta(`${global.themeemoji || '•'} CREDIT: CASEYRHODES`))
-                console.log(chalk.green(`${global.themeemoji || '•'} 🤖 Bot Connected Successfully! ✅`))
-            }
-
-            // reconnect logic preserved
-            if (
-                connection === "close" &&
-                lastDisconnect &&
-                lastDisconnect.error &&
-                lastDisconnect.error.output.statusCode != 401
-            ) {
-                console.log(chalk.yellow('[CONN] Connection closed unexpectedly, attempting restart...'))
-                // small delay to avoid tight loop
-                setTimeout(() => startXeonBotInc().catch(e => console.error('[CONN] restart failed', e)), 2000)
-            }
-
-        } catch (e) {
-            console.error('[connection.update] handler error', e)
-        }
-    })
-
-    // Save credentials when updated
-    XeonBotInc.ev.on('creds.update', async () => {
-        try {
-            await saveCreds()
-            // If we used single-file creds and we want to ensure the file is placed
-            if (authSingle) {
-                console.log(chalk.green(`[AUTH] Single-file credentials saved to ${authPath}`))
-            } else {
-                console.log(chalk.green(`[AUTH] Credentials saved to ${authPath}`))
-            }
-        } catch (err) {
-            console.error(chalk.red('[AUTH] Failed to save credentials:'), err)
-        }
-    })
-
-    // Message handling (use your main handlers)
     XeonBotInc.ev.on('messages.upsert', async chatUpdate => {
         try {
             const mek = chatUpdate.messages[0]
@@ -274,7 +221,6 @@ async function startXeonBotInc() {
                 await handleMessages(XeonBotInc, chatUpdate, true)
             } catch (err) {
                 console.error("Error in handleMessages:", err)
-                // Only try to send error message if we have a valid chatId
                 if (mek.key && mek.key.remoteJid) {
                     await XeonBotInc.sendMessage(mek.key.remoteJid, { 
                         text: '❌ An error occurred while processing your message.',
@@ -295,7 +241,7 @@ async function startXeonBotInc() {
         }
     })
 
-    // other handlers preserved
+    // decodeJid, contacts.update, getName, public, serializeM etc - keep as you had
     XeonBotInc.decodeJid = (jid) => {
         if (!jid) return jid
         if (/:\d+@/gi.test(jid)) {
@@ -330,10 +276,9 @@ async function startXeonBotInc() {
     }
 
     XeonBotInc.public = true
-
     XeonBotInc.serializeM = (m) => smsg(XeonBotInc, m, store)
 
-    // Pairing code interactive flow preserved (unchanged)
+    // pairingCode logic: preserved but only used if pairingCode true (interactive) AND no session restored
     if (pairingCode && !XeonBotInc.authState?.creds?.registered) {
         if (useMobile) throw new Error('Cannot use pairing code with mobile api')
 
@@ -344,14 +289,11 @@ async function startXeonBotInc() {
             phoneNumber = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 6281376552730 (without + or spaces) : `)))
         }
 
-        // Clean the phone number - remove any non-digit characters
         phoneNumber = phoneNumber.replace(/[^0-9]/g, '')
-
-        // Validate the phone number using awesome-phonenumber
-        const pn = require('awesome-phonenumber');
+        const pn = require('awesome-phonenumber')
         if (!pn('+' + phoneNumber).isValid()) {
-            console.log(chalk.red('Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, etc.) without + or spaces.'));
-            process.exit(1);
+            console.log(chalk.red('Invalid phone number. Please enter your full international number.'))
+            process.exit(1)
         }
 
         setTimeout(async () => {
@@ -359,28 +301,55 @@ async function startXeonBotInc() {
                 let code = await XeonBotInc.requestPairingCode(phoneNumber)
                 code = code?.match(/.{1,4}/g)?.join("-") || code
                 console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
-                console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app:\n1. Open WhatsApp\n2. Go to Settings > Linked Devices\n3. Tap "Link a Device"\n4. Enter the code shown above`))
+                console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app: Settings > Linked Devices > Link a Device > Enter code`))
             } catch (error) {
                 console.error('Error requesting pairing code:', error)
-                console.log(chalk.red('Failed to get pairing code. Please check your phone number and try again.'))
+                console.log(chalk.red('Failed to get pairing code.'))
             }
         }, 3000)
     }
 
+    // connection.update
+    XeonBotInc.ev.on('connection.update', async (s) => {
+        const { connection, lastDisconnect } = s
+        if (connection == "open") {
+            console.log(chalk.magenta(` `))
+            console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
+            
+            const botNumber = XeonBotInc.user.id.split(':')[0] + '@s.whatsapp.net';
+            await XeonBotInc.sendMessage(botNumber, { 
+                text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!`,
+                contextInfo: { forwardingScore: 1, isForwarded: true }
+            }).catch(()=>{})
+            await delay(1999)
+            console.log(chalk.green(`${global.themeemoji || '•'} 🤖 Bot Connected Successfully! ✅`))
+        }
+        if (
+            connection === "close" &&
+            lastDisconnect &&
+            lastDisconnect.error &&
+            lastDisconnect.error.output.statusCode != 401
+        ) {
+            console.log(chalk.yellow('[CONN] Connection closed. Restarting...'))
+            startXeonBotInc().catch(e => console.error('[CONN] restart error', e))
+        }
+    })
+
+    // save creds on update
+    XeonBotInc.ev.on('creds.update', saveCreds)
+
+    // group participant update, status handlers preserved
     XeonBotInc.ev.on('group-participants.update', async (update) => {
         await handleGroupParticipantUpdate(XeonBotInc, update);
     });
-
     XeonBotInc.ev.on('messages.upsert', async (m) => {
         if (m.messages[0].key && m.messages[0].key.remoteJid === 'status@broadcast') {
             await handleStatus(XeonBotInc, m);
         }
     });
-
     XeonBotInc.ev.on('status.update', async (status) => {
         await handleStatus(XeonBotInc, status);
     });
-
     XeonBotInc.ev.on('messages.reaction', async (status) => {
         await handleStatus(XeonBotInc, status);
     });
@@ -388,19 +357,15 @@ async function startXeonBotInc() {
     return XeonBotInc
 }
 
-// Start the bot with error handling
+// Start
 startXeonBotInc().catch(error => {
     console.error('Fatal error:', error)
     process.exit(1)
 })
-process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err)
-})
+process.on('uncaughtException', (err) => { console.error('Uncaught Exception:', err) })
+process.on('unhandledRejection', (err) => { console.error('Unhandled Rejection:', err) })
 
-process.on('unhandledRejection', (err) => {
-    console.error('Unhandled Rejection:', err)
-})
-
+// watch + auto-require for dev
 let file = require.resolve(__filename)
 fs.watchFile(file, () => {
     fs.unwatchFile(file)
