@@ -1,0 +1,32 @@
+{
+  "name": "𝗦EXY-𝗠𝗗",
+  "description": "Modern WhatsApp Bot with Heroku Custom Environment Setup",
+  "repository": "https://github.com/YOUR_USERNAME/YOUR_REPO",
+  "logo": "https://telegra.ph/file/4a82c83a3dc80d5c9b784.png",
+  "keywords": ["whatsapp", "bot", "baileys", "multi-device"],
+  "env": {
+    "SESSION_ID": {
+      "description": "Enter your Base64 Encoded WhatsApp Session (generated from creds.json)",
+      "required": true
+    },
+    "BOT_NAME": {
+      "description": "Enter your bot name",
+      "value": "SEXY-MD"
+    },
+    "PREFIX": {
+      "description": "Command prefix for your bot",
+      "value": "!"
+    }
+  },
+"formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "standard-2x"
+    }
+  },
+  "addons": [
+    {
+      "plan": "heroku-postgresql:essential-0"
+    }
+  ]
+}
