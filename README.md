@@ -13,9 +13,9 @@ Be happy 😊
 
 Click below to download the ZIP version directly:
   
-🔗 [Download ZIP](https://github.com/makamesco/SEXY-MD/archive/refs/heads/main.zip)
+🔗 [Download ZIP](https://github.com/sesco001/SEXY-MD/archive/refs/heads/main.zip)
 
 Or clone it via Git:
 
 ```bash
-git clone https://github.com/makamesco/SEXY-MD
+git clone https://github.com/sesco001/SEXY-MD
